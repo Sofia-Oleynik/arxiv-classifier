@@ -19,7 +19,7 @@ def load_model():
     
     # Скачиваем модель
     url = f"https://drive.google.com/file/d/19y-qN-IKmw8ymKde1eShkEkQEnsAgzJV/view?usp=drive_link"
-    zip_path = "/tmp/model.zip"
+    zip_path = "/tmp/best_model.zip"
     extract_path = "/tmp/best_model"
     
     if not os.path.exists(extract_path):
