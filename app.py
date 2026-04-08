@@ -1,38 +1,79 @@
 import streamlit as st
 import torch
+import numpy as np
 from transformers import DistilBertForSequenceClassification, AutoTokenizer
 from torch.nn import Softmax
-import numpy as np
 
-# Настройка страницы
 st.set_page_config(
     page_title="arXiv Classifier",
     page_icon="📚",
     layout="centered"
 )
 
+st.title("📚 arXiv Article Classifier")
+st.markdown("Определите тематику научной статьи по названию и аннотации")
+
+CATEGORY_NAMES = {
+    'cs.AI': '🤖 Artificial Intelligence',
+    'cs.CL': '💬 Computation & Language',
+    'cs.CV': '👁️ Computer Vision',
+    'physics': '⚛️ Physics',
+    'math': '📐 Mathematics',
+    'q-bio': '🧬 Quantitative Biology'
+}
+
 @st.cache_resource
 def load_model():
-    model_path = "./best_model"
-    model = DistilBertForSequenceClassification.from_pretrained(model_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model.eval()
-    return model, tokenizer
+    """
+    Модель загружается один раз при первом вызове
+    и сохраняется в кэше Streamlit.
+    """
+    try:
+        model_name = "sofia-ol/arxiv-classifier" 
+        
+        with st.spinner("📦 Загрузка модели... "):
+            model = DistilBertForSequenceClassification.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
+            model.eval()
+            
+            # Перемещаем на GPU если доступно
+            if torch.cuda.is_available():
+                model = model.cuda()
+            
+        st.success("✅ Модель успешно загружена!")
+        return model, tokenizer
+        
+    except Exception as e:
+        st.error(f"❌ Ошибка загрузки модели: {e}")
+        return None, None
 
-def predict(text, model, tokenizer, threshold=0.95):
-    """Предсказание с накоплением вероятностей до 95%"""
+def predict_article(text, model, tokenizer, threshold=0.95):
+    """Предсказание категории с топ-95% вероятностей"""
+    if model is None or tokenizer is None:
+        return [("⚠️ Модель не загружена", 1.0)]
+    
+    # Определяем устройство модели
+    device = next(model.parameters()).device
+    
+    # Токенизация
     inputs = tokenizer(
         text,
         return_tensors="pt",
         truncation=True,
-        max_length=512,
+        max_length=384,
         padding=True
     )
     
+    # Перемещаем на то же устройство, что и модель
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Инференс
     with torch.no_grad():
         outputs = model(**inputs)
-        probs = Softmax(dim=1)(outputs.logits).squeeze().numpy()
+        probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        probs = probs.cpu().numpy().squeeze()
     
+    # Сортировка и накопление до 95%
     indices = np.argsort(probs)[::-1]
     cumulative = 0
     results = []
@@ -41,67 +82,82 @@ def predict(text, model, tokenizer, threshold=0.95):
         prob = probs[idx]
         cumulative += prob
         category = model.config.id2label[idx]
-        
-        category_names = {
-            'cs.AI': '🤖 Искусственный интеллект',
-            'cs.CL': '💬 Обработка естественного языка',
-            'cs.CV': '👁️ Компьютерное зрение',
-            'physics': '⚛️ Физика',
-            'math': '📐 Математика',
-            'q-bio': '🧬 Биология'
-        }
-        display_name = category_names.get(category, category)
+        display_name = CATEGORY_NAMES.get(category, category)
         results.append((display_name, prob, category))
+        
         if cumulative >= threshold:
             break
     
     return results
 
-st.title("📚 arXiv Статья Классификатор")
-st.markdown("""
-Определяет тематику научной статьи по **названию** и **аннотации**.
-Модель обучена на 18,000+ статей из arXiv.org.
-""")
+# ============================================
+# ИНТЕРФЕЙС
+# ============================================
 
-st.subheader("Введите данные статьи")
-
-title = st.text_input("📌 Название статьи *", placeholder="Например: Attention is All You Need")
-
-abstract = st.text_area(
-    "📄 Аннотация (необязательно)",
-    placeholder="Введите аннотацию статьи здесь...",
-    height=150
+# Поля ввода
+title = st.text_area(
+    "📌 **Название статьи** *",
+    placeholder="Пример: Attention is All You Need",
+    height=100
 )
 
-if title.strip() == "":
-    st.warning("⚠️ Пожалуйста, введите название статьи")
-    st.stop()
+abstract = st.text_area(
+    "📄 **Аннотация** (необязательно)",
+    placeholder="Введите аннотацию здесь...",
+    height=200
+)
 
-if abstract.strip():
-    full_text = title + " [SEP] " + abstract
-else:
-    full_text = title
+# Слайдер для порога уверенности
+threshold = st.slider(
+    "🎯 Порог уверенности",
+    min_value=0.5,
+    max_value=0.99,
+    value=0.95,
+    step=0.01,
+    help="Показывать категории, пока суммарная вероятность не превысит этот порог"
+)
 
-if st.button("🔍 Определить тематику", type="primary"):
-    with st.spinner("Анализирую статью..."):
-        try:
+# Кнопка классификации
+if st.button("🔍 Классифицировать", type="primary"):
+    if not title.strip():
+        st.error("❌ Пожалуйста, введите название статьи")
+    else:
+        # Объединяем текст
+        full_text = title
+        if abstract.strip():
+            full_text = title + " [SEP] " + abstract
+        
+        # Показываем спиннер только во время предсказания (модель уже загружена!)
+        with st.spinner("🧠 Анализирую статью..."):
+            # Модель загружается здесь, но ТОЛЬКО ПРИ ПЕРВОМ ЗАПРОСЕ
             model, tokenizer = load_model()
-            predictions = predict(full_text, model, tokenizer)
+            predictions = predict_article(full_text, model, tokenizer, threshold)
             
-            st.subheader("📊 Результаты классификации")
-            
-            for display_name, prob, cat in predictions:
-                st.markdown(f"**{display_name}**")
-                st.progress(float(prob), text=f"{prob*100:.1f}%")
-            
-            if len(predictions) == 1:
-                st.success(f"✅ Статья однозначно относится к категории **{predictions[0][0]}**")
-            else:
-                st.info(f"📌 Статья может относиться к нескольким областям (топ-{len(predictions)} категорий, суммарная вероятность > 95%)")
+            if predictions:
+                st.subheader("📊 Результаты классификации")
                 
-        except Exception as e:
-            st.error(f"❌ Ошибка: {str(e)}")
-            st.markdown("Попробуйте ввести другой текст или проверьте подключение.")
+                # Отображаем результаты с прогресс-барами
+                for display_name, prob, category in predictions:
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.markdown(f"**{display_name}**")
+                        st.progress(float(prob), text=f"{prob*100:.1f}%")
+                    with col2:
+                        st.caption(f"`{category}`")
+                
+                # Пояснение
+                if len(predictions) == 1:
+                    st.success(f"✅ Статья однозначно относится к категории **{predictions[0][0]}**")
+                else:
+                    st.info(f"📌 Статья относится к {len(predictions)} областям (суммарная вероятность > {threshold*100:.0f}%)")
+            else:
+                st.warning("⚠️ Не удалось получить предсказания")
 
+# Footer
 st.markdown("---")
-st.caption("Built with DistilBERT | Trained on arXiv papers | Deployed on Hugging Face Spaces")
+st.caption("Built with DistilBERT | Fine-tuned on arXiv papers | Deployed with Streamlit")
+
+# Информация о статусе модели (для отладки)
+with st.expander("ℹ️ Информация о модели"):
+    st.write("Модель загружается один раз при первом запросе и кэшируется")
+    st.write("Благодаря `@st.cache_resource` последующие запросы работают мгновенно")
